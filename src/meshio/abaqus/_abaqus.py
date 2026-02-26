@@ -4,6 +4,7 @@ I/O for Abaqus inp files.
 
 import pathlib
 from itertools import count
+import warnings
 
 import numpy as np
 
@@ -13,6 +14,9 @@ from .._exceptions import ReadError
 from .._files import open_file
 from .._helpers import register_format
 from .._mesh import CellBlock, Mesh
+
+NODE_REGISTRY = {}
+ELEMENT_REGISTRY = {}
 
 abaqus_to_meshio_type = {
     # trusses
@@ -24,6 +28,7 @@ abaqus_to_meshio_type = {
     "T3D2H": "line",
     "T3D3": "line3",
     "T3D3H": "line3",
+    "CONN3D2": "line",
     # beams
     "B21": "line",
     "B21H": "line",
@@ -98,6 +103,10 @@ abaqus_to_meshio_type = {
     # 6-node quadratic
     "CPE6": "triangle6",
 }
+skip_abaqus_type = (
+    "MASS",
+    "ROTARYI"
+)
 meshio_to_abaqus_type = {v: k for k, v in abaqus_to_meshio_type.items()}
 
 
@@ -139,6 +148,11 @@ def read_buffer(f):
             if point_ids is None:
                 raise ReadError("Expected NODE before ELEMENT")
             params_map = get_param_map(line, required_keys=["TYPE"])
+            etype = params_map["TYPE"]
+            if etype in skip_abaqus_type:
+                warnings.warn(f"Skipping element type: {etype}", stacklevel=2)
+                line = f.readline()
+                continue
             cell_type, cells_data, ids, sets, line = _read_cells(
                 f, params_map, point_ids
             )
@@ -235,6 +249,8 @@ def _read_nodes(f):
     counter = 0
     while True:
         line = f.readline()
+        if line and line.startswith("**"):
+            continue
         if not line or line.startswith("*"):
             break
         if line.strip() == "":
@@ -251,6 +267,7 @@ def _read_nodes(f):
 
 def _read_cells(f, params_map, point_ids):
     etype = params_map["TYPE"]
+
     if etype not in abaqus_to_meshio_type.keys():
         raise ReadError(f"Element type not available: {etype}")
 
@@ -261,6 +278,8 @@ def _read_cells(f, params_map, point_ids):
     idx = []
     while True:
         line = f.readline()
+        if line and line.startswith("**"):
+            continue
         if not line or line.startswith("*"):
             break
         line = line.strip()
@@ -380,6 +399,8 @@ def _read_set(f, params_map):
     set_names = []
     while True:
         line = f.readline()
+        if line and line.startswith("**"):
+            continue
         if not line or line.startswith("*"):
             break
         if line.strip() == "":
