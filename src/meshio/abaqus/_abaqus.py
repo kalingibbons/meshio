@@ -2,9 +2,11 @@
 I/O for Abaqus inp files.
 """
 
+from dataclasses import dataclass, field
 import pathlib
 from itertools import count
 import warnings
+
 
 import numpy as np
 
@@ -15,8 +17,110 @@ from .._files import open_file
 from .._helpers import register_format
 from .._mesh import CellBlock, Mesh
 
+
+class FileData:
+    def __init__(self):
+        self.points = np.empty((0, 3))
+        self.cells: dict[str,]
+        self.cell_ids: dict[str, tuple[str, int]] = {}
+        self.point_sets: dict[str, np.ndarray] = {}
+        self.cell_sets = {}
+        self.cell_sets_element = {}  # Handle cell sets defined in ELEMENT
+        self.cell_sets_element_order = []  # Order of keys is not preserved in Python 3.5
+        self.field_data = {}
+        self.cell_data = {}
+        self.point_data = {}
+        self.point_ids = {}
+        self.cell_sets_dict = {}
+
+
+@dataclass
+class AbaqusRegistry:
+    filenames: list = field(default_factory=list)
+    points: np.array = field(default_factory=lambda: np.empty((0, 3)))
+    # cells:
+    point_ids: dict[int, int] = field(default_factory=dict)
+    cell_ids: dict[str, tuple[str, int]] = field(default_factory=dict)
+    point_sets: dict[str, np.ndarray] = field(default_factory=dict)
+    cell_sets: dict[str, np.ndarray] = field(default_factory=dict)
+    # cell_sets_element = {}  # Handle cell sets defined in ELEMENT
+    # cell_sets_element_order = []  # Order of keys is not preserved in Python 3.5
+    # field_data = dict[str, tuple[{}
+    # cell_data = {}
+    # point_data = {}
+    cells_dict: dict[str, np.ndarray] = field(default_factory=dict)
+
+    @property
+    def n_points(self):
+        return self.points.shape[0]
+
+    def _reset(self):
+        self.cells_dict = {}
+
+    def register_filename(self, filename):
+        try:
+            filename = pathlib.Path(filename)
+        except TypeError:
+            filename = pathlib.Path(filename.name)
+        self.filenames.append(filename)
+
+    def process_node_block(self, points, point_ids, point_sets):
+        self.point_ids.update({k: v + self.n_points for k, v in point_ids.items()})
+        self.point_sets.update({k: v + self.n_points for k, v in point_sets.items()})
+        self.points = np.vstack((self.points, points))  # Always last
+
+    def process_element_block(
+        self, cell_type, cells_data, cell_ids, cell_sets, point_ids
+    ):
+        pid_to_nid = {v: k for k, v in point_ids.items()}
+        cid_to_eid = {v: k for k, v in cell_ids.items()}
+        n_cells = self.cells_dict.setdefault(
+            cell_type, np.empty([0, cells_data.shape[1]], dtype=int)
+        ).shape[0]
+        try:
+            cell_ids = {k.item(): v + n_cells for k, v in cell_ids.items()}
+        except AttributeError:
+            cell_ids = {k: v + n_cells for k, v in cell_ids.items()}
+        self.cell_ids.update({k: (cell_type, v) for k, v in cell_ids.items()})
+        updated_cells_data = np.array(
+            [self.point_ids[pid_to_nid[x]] for x in cells_data.flat]
+        ).reshape(cells_data.shape)
+        self.cells_dict[cell_type] = np.vstack(
+            (self.cells_dict[cell_type], updated_cells_data)
+        )
+        self.cell_sets.update(
+            {k: np.array([cid_to_eid[x] for x in v]) for k, v in cell_sets.items()}
+        )
+
+    def process_elset_block(self, name: str, set_ids: np.ndarray, cell_ids, set_names):
+        if set_ids.size:
+            self.cell_sets[name] = np.array(
+                [set_id for set_id in set_ids if set_id in self.cell_ids]
+            )
+        elif set_names:
+            for set_name in set_names:
+                if set_name in cell_sets.keys():
+                    cell_sets[name].append(cell_sets[set_name])
+                elif set_name in cell_sets_element.keys():
+                    cell_sets[name].append(cell_sets_element[set_name])
+                else:
+                    raise ReadError(f"Unknown cell set '{set_name}'")
+        pass
+
+    def process_nset_block(self, name: str, set_ids: np.array):
+        self.point_sets[name] = np.array(
+            [self.point_ids[point_id] for point_id in set_ids], dtype="int32"
+        )
+
+
+FILE_REGISTRY = AbaqusRegistry()
 NODE_REGISTRY = {}
 ELEMENT_REGISTRY = {}
+
+
+def reset_file_registry():
+    FILE_REGISTRY._reset()
+
 
 abaqus_to_meshio_type = {
     # trusses
@@ -103,16 +207,14 @@ abaqus_to_meshio_type = {
     # 6-node quadratic
     "CPE6": "triangle6",
 }
-skip_abaqus_type = (
-    "MASS",
-    "ROTARYI"
-)
+skip_abaqus_type = ("MASS", "ROTARYI")
 meshio_to_abaqus_type = {v: k for k, v in abaqus_to_meshio_type.items()}
 
 
 def read(filename):
     """Reads a Abaqus inp file."""
     with open_file(filename, "r") as f:
+        FILE_REGISTRY.register_filename(filename)
         out = read_buffer(f)
     return out
 
@@ -143,7 +245,12 @@ def read_buffer(f):
 
         keyword = line.partition(",")[0].strip().replace("*", "").upper()
         if keyword == "NODE":
-            points, point_ids, line = _read_nodes(f)
+            params_map = get_param_map(line)
+            points, point_ids, node_set, line = _read_nodes(f, params_map)
+            if node_set:
+                name = params_map["NSET"]
+                point_sets.update(node_set)
+            FILE_REGISTRY.process_node_block(points, point_ids, point_sets)
         elif keyword == "ELEMENT":
             if point_ids is None:
                 raise ReadError("Expected NODE before ELEMENT")
@@ -156,6 +263,9 @@ def read_buffer(f):
             cell_type, cells_data, ids, sets, line = _read_cells(
                 f, params_map, point_ids
             )
+            FILE_REGISTRY.process_element_block(
+                cell_type, cells_data, ids, sets, point_ids
+            )
             cells.append(CellBlock(cell_type, cells_data))
             cell_ids.append(ids)
             if sets:
@@ -165,14 +275,29 @@ def read_buffer(f):
             params_map = get_param_map(line, required_keys=["NSET"])
             set_ids, _, line = _read_set(f, params_map)
             name = params_map["NSET"]
-            point_sets[name] = np.array(
-                [point_ids[point_id] for point_id in set_ids], dtype="int32"
-            )
+            FILE_REGISTRY.process_nset_block(name, set_ids)
+            try:
+                point_sets[name] = np.array(
+                    [point_ids[point_id] for point_id in set_ids], dtype="int32"
+                )
+            except KeyError:
+                ps = FILE_REGISTRY.point_sets[name]
+                n_points = points.shape[0]
+                points = np.vstack((points, FILE_REGISTRY.points[ps]))
+                pid_to_nid = {v: k for k, v in FILE_REGISTRY.point_ids.items() if v in ps}
+                point_sets[name] = np.arange(ps.size) + n_points
+                for pid, sid in zip(ps, point_sets[name]):
+                    point_ids.update(
+                        {pid_to_nid[pid]: sid}
+                    )
+                pass
+                
         elif keyword == "ELSET":
             params_map = get_param_map(line, required_keys=["ELSET"])
             set_ids, set_names, line = _read_set(f, params_map)
             name = params_map["ELSET"]
             cell_sets[name] = []
+            FILE_REGISTRY.process_elset_block(name, set_ids, cell_ids, set_names)
             if set_ids.size:
                 for cell_ids_ in cell_ids:
                     cell_sets_ = np.array(
@@ -243,7 +368,7 @@ def read_buffer(f):
     )
 
 
-def _read_nodes(f):
+def _read_nodes(f, params_map):
     points = []
     point_ids = {}
     counter = 0
@@ -262,7 +387,13 @@ def _read_nodes(f):
         points.append([float(x) for x in coords])
         counter += 1
 
-    return np.array(points, dtype=float), point_ids, line
+    node_set = (
+        {params_map["NSET"]: np.arange(len(points), dtype="int32")}
+        if "NSET" in params_map.keys()
+        else {}
+    )
+
+    return np.array(points, dtype=float), point_ids, node_set, line
 
 
 def _read_cells(f, params_map, point_ids):
